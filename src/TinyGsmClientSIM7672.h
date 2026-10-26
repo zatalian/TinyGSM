@@ -1398,6 +1398,16 @@ class TinyGsmSim7672 : public TinyGsmModem<TinyGsmSim7672>,
             DBG("### SSL peer closed:", mux);
           }
           data = "";
+        } else if (data.endsWith(GF("+CMQTTCONNLOST:"))) {
+          // +CMQTTCONNLOST: <client_index>,<cause> — MQTT session dropped
+          int idx   = streamGetIntBefore(',');
+          int cause = streamGetIntBefore('\n');
+          this->mqttNoteConnLost(idx, cause);
+          data = "";
+        } else if (data.endsWith(GF("+CMQTTPUB:"))) {
+          // Late/unclaimed publish result (mqtt_publish claims its own) — discard
+          streamSkipUntil('\n');
+          data = "";
         } else if (data.endsWith(GF("+CCHEVENT:"))) {
           // +CCHEVENT: <session_id>,RECV EVENT  (recv_mode=1 data-ready notification)
           int8_t mux = streamGetIntBefore(',');

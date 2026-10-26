@@ -30,6 +30,15 @@ protected:
     uint8_t will_qos = 0;
     bool _isConnected = false;
     uint32_t _lastCheckConnect = 0;
+    // Set from the modem's +CMQTTCONNLOST URC (see the SIM7672 waitResponse):
+    // the MQTT session is gone and the caller must reconnect. The modem still
+    // answers "OK" to AT+CMQTTPUB on a dead session, so without this flag (and
+    // the +CMQTTPUB result check in mqtt_publish) a lost session goes unnoticed.
+    volatile bool _connLost = false;
+    int _connLostCause = -1;
+    // How long mqtt_publish waits for the +CMQTTPUB: result URC after the OK.
+    static const uint32_t PUB_RESULT_WAIT_QOS0_MS = 3000;
+    static const uint32_t PUB_RESULT_WAIT_QOS1_MS = 8000;
 
 public:
     /*
@@ -60,6 +69,7 @@ public:
         this->client_cert_pem = NULL;
         this->client_key_pem = NULL;
         _isConnected = false;
+        _connLost = false;
         _lastCheckConnect = 0;
         memset(this->buffer, 0, bufferSize);
         thisModem().sendAT("+CMQTTSTART");
@@ -220,6 +230,7 @@ public:
         thisModem().streamSkipUntil(',');
         int res = thisModem().stream.read();
         if (res != '0')return false;
+        _connLost = false;
         return true;
 
     }
@@ -285,8 +296,50 @@ public:
         if (thisModem().waitResponse() != 1) {
             return false;
         }
-        return true;
+        // The OK above only means the modem accepted the command. The real
+        // outcome arrives as +CMQTTPUB: <client_index>,<err> (err 0 = sent, and
+        // for QoS 1 acknowledged by the broker). A lost session shows up here as
+        // an error code, a +CMQTTCONNLOST, or no result at all.
+        int8_t r = thisModem().waitResponse(qos ? PUB_RESULT_WAIT_QOS1_MS : PUB_RESULT_WAIT_QOS0_MS,
+                                            "+CMQTTPUB:", "+CMQTTCONNLOST:");
+        if (r == 1) {
+            thisModem().streamGetIntBefore(',');              // client index
+            int err = thisModem().streamGetIntBefore('\n');
+            if (err != 0) {
+                DBG("### MQTT publish failed, err", err);
+            }
+            return err == 0;
+        }
+        if (r == 2) {
+            int idx   = thisModem().streamGetIntBefore(',');
+            int cause = thisModem().streamGetIntBefore('\n');
+            mqttNoteConnLost(idx, cause);
+        } else {
+            DBG("### MQTT publish: no result URC");
+        }
+        return false;
     }
+
+    // Called when +CMQTTCONNLOST: <client_index>,<cause> is seen, from here or
+    // from the modem's generic URC handling.
+    void mqttNoteConnLost(int clientIndex, int cause)
+    {
+        DBG("### MQTT connection lost, client", clientIndex, "cause", cause);
+        _isConnected = false;
+        _connLost = true;
+        _connLostCause = cause;
+    }
+
+    // True once if the broker session was reported lost since the last call
+    // (the flag is cleared on read); mqtt_connlost_cause() has the modem's cause code.
+    bool mqtt_connection_lost()
+    {
+        bool lost = _connLost;
+        _connLost = false;
+        return lost;
+    }
+
+    int mqtt_connlost_cause() { return _connLostCause; }
 
     bool mqtt_subscribe(uint8_t clientIndex, const char *topic, uint8_t qos = 0, uint8_t dup = 0)
     {
